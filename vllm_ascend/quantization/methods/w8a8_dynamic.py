@@ -146,6 +146,15 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         param_dict["w2_weight"] = torch.empty(
             num_experts, hidden_sizes, intermediate_size_per_partition, dtype=torch.int8
         )
+        param_dict["w13_weight_bak"] = torch.empty(num_experts,
+                                               2 *
+                                               intermediate_size_per_partition,
+                                               hidden_sizes,
+                                               dtype=torch.int8)
+        param_dict["w2_weight_bak"] = torch.empty(num_experts,
+                                              hidden_sizes,
+                                              intermediate_size_per_partition,
+                                              dtype=torch.int8)
         return param_dict
 
     def get_dynamic_quant_param(
@@ -276,6 +285,8 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         return final_hidden_states
 
     def process_weights_after_loading(self, layer):
+        layer.w13_weight_bak.data = layer.w13_weight.data.clone()
+        layer.w2_weight_bak.data = layer.w2_weight.data.clone()
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
         # TODO(zzzzwwjj): Currently, `torch_npu.npu_grouped_matmul_swiglu_quant`

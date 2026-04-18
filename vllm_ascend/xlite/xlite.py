@@ -20,7 +20,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
-from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size, get_world_group
+from vllm.distributed import (get_ep_group, get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size, get_world_group)
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
@@ -35,8 +36,11 @@ from xlite._C import (  # type: ignore[attr-defined]
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.attention.attention_v1 import AscendAttentionState, AscendMetadata
+from vllm_ascend.attention.attention_v1 import (AscendAttentionState, AscendMetadata)
+from vllm_ascend.utils import ASCEND_QUANTIZATION_METHOD
 
+QuantAscend = 1
+NoQuant = 0
 
 class XliteModel:
     def initialize(self, runnable: nn.Module, vllm_config: VllmConfig) -> tuple[Model, int, int, torch.dtype]:
@@ -98,10 +102,18 @@ class LlamaXliteModel(XliteModel):
             config.mrope_section = rope_parameters.get("mrope_section", [])
         if hasattr(config, "mrope_interleaved"):
             config.mrope_interleaved = rope_parameters.get("mrope_interleaved", False)
+
+        if vllm_config.quant_config != None:
+            self.quantization = QuantAscend
+            # config.attn_weight_transpose = True
+        else:
+            self.quantization = NoQuant
+
         return config
 
     def _build_model(self, runnable: nn.Module, vllm_config: VllmConfig, config: ModelConfig) -> Model:
         params_dict = dict(runnable.named_parameters())
+        tp_rank = get_tensor_model_parallel_rank()
 
         if hasattr(runnable, "language_model"):
             layers = runnable.language_model.model.layers
@@ -139,6 +151,68 @@ class LlamaXliteModel(XliteModel):
         q_norm = [layer.self_attn.q_norm.weight for layer in layers if hasattr(layer.self_attn, "q_norm")]
         k_norm = [layer.self_attn.k_norm.weight for layer in layers if hasattr(layer.self_attn, "k_norm")]
 
+        if self.quantization == QuantAscend:
+            xlite_model.norm_bias = params_dict.get(model_prefix + "model.norm.bias")
+            xlite_model.attn_norm_bias = [
+                layer.input_layernorm.bias for layer in layers
+            ]
+            xlite_model.mlp_norm_bias = [
+                layer.post_attention_layernorm.bias for layer in layers
+            ]
+            # quant weights
+            xlite_model.attn_out_input_scale = [
+                layer.self_attn.o_proj.aclnn_input_scale_reciprocal
+                for layer in layers
+            ]
+            xlite_model.attn_out_input_offset = [
+                layer.self_attn.o_proj.aclnn_input_offset for layer in layers
+            ]
+            # only tp_rank == 0 in rowparallellinear need to add quant_bias
+            xlite_model.attn_out_quant_bias = [
+                layer.self_attn.o_proj.quant_bias for layer in layers
+            ]
+            xlite_model.attn_out_deq_scale = [
+                self._prepare_deq_scale_weights(layer.self_attn.o_proj.deq_scale)
+                for layer in layers
+            ]
+            xlite_model.mha_qkv_input_scale = [
+                layer.self_attn.qkv_proj.aclnn_input_scale_reciprocal for layer in layers
+            ]
+            xlite_model.mha_qkv_input_offset = [
+                layer.self_attn.qkv_proj.aclnn_input_offset for layer in layers
+            ]
+            xlite_model.mha_qkv_quant_bias = [
+                layer.self_attn.qkv_proj.quant_bias for layer in layers
+            ]
+            xlite_model.mha_qkv_deq_scale = [
+                self._prepare_deq_scale_weights(layer.self_attn.qkv_proj.deq_scale)
+                for layer in layers
+            ]
+            xlite_model.attn_out = [
+                layer.self_attn.o_proj.weight.data.transpose(0, 1).contiguous()
+                # layer.self_attn.o_proj.weight.data
+                for layer in layers
+            ]
+            xlite_model.mha_qkv = [
+                layer.self_attn.qkv_proj.weight.data.transpose(0, 1).contiguous()
+                # layer.self_attn.qkv_proj.weight.data
+                for layer in layers
+            ]
+            if tp_rank == 0:
+                torch.set_printoptions(threshold=500)
+                print(f"norm_bias: {xlite_model.norm_bias}, shape: {xlite_model.norm_bias.shape}")
+                print(f"attn_norm_bias: {xlite_model.attn_norm_bias[0]}, shape: {xlite_model.attn_norm_bias[0].shape}")
+                print(f"mlp_norm: {xlite_model.mlp_norm[0]}, shape: {xlite_model.mlp_norm[0].shape}")
+                print(f"mha_qkv: {xlite_model.mha_qkv[0]}, shape: {xlite_model.mha_qkv[0].shape}")
+                print(f"input_scale: {xlite_model.attn_out_input_scale[0]}, shape: {xlite_model.attn_out_input_scale[0].shape}")
+                print(f"input_offset: {xlite_model.attn_out_input_offset[0]}, shape: {xlite_model.attn_out_input_offset[0].shape}")
+                print(f"quant_bias: {xlite_model.attn_out_quant_bias[0]}, shape: {xlite_model.attn_out_quant_bias[0].shape}")
+                print(f"deq_scale: {xlite_model.attn_out_deq_scale[0]}, shape: {xlite_model.attn_out_deq_scale[0].shape}")
+                print(f"mha_qkv_input_scale: {xlite_model.mha_qkv_input_scale[0]}, shape: {xlite_model.mha_qkv_input_scale[0].shape}")
+                print(f"mha_qkv_input_offset: {xlite_model.mha_qkv_input_offset[0]}, shape: {xlite_model.mha_qkv_input_offset[0].shape}")
+                print(f"mha_qkv_quant_bias: {xlite_model.mha_qkv_quant_bias[0]}, shape: {xlite_model.mha_qkv_quant_bias[0].shape}")
+                print(f"mha_qkv_deq_scale: {xlite_model.mha_qkv_deq_scale[0]}, shape: {xlite_model.mha_qkv_deq_scale[0].shape}")
+
         if len(mha_qkv_bias) != config.n_layers:
             config.qkv_bias = False
         else:
@@ -151,6 +225,18 @@ class LlamaXliteModel(XliteModel):
             config.qk_norm = True
             xlite_model.mha_q_norm = q_norm
             xlite_model.mha_k_norm = k_norm
+            if self.quantization == QuantAscend:
+                xlite_model.mha_q_norm_bias = [
+                    layer.self_attn.q_norm.bias for layer in layers
+                    if hasattr(layer.self_attn, "q_norm")
+                ]
+                xlite_model.mha_k_norm_bias = [
+                    layer.self_attn.k_norm.bias for layer in layers
+                    if hasattr(layer.self_attn, "k_norm")
+                ]
+                if tp_rank == 0:
+                    print(f"q_norm_bias: {xlite_model.mha_q_norm_bias[0]}, shape: {xlite_model.mha_q_norm_bias[0].shape}")
+                    print(f"k_norm_bias: {xlite_model.mha_k_norm_bias[0]}, shape: {xlite_model.mha_k_norm_bias[0].shape}")
 
         return xlite_model
 
@@ -163,6 +249,26 @@ class LlamaXliteModel(XliteModel):
         freq_cis = torch.cat((cos_cache, sin_cache), dim=-1)
         return freq_cis.to(device="npu")
 
+    def _prepare_deq_scale_weights(self, deq_scale: torch.Tensor):
+        '''
+        The data format required by the fixpipe hardware is as follows:
+        Data is stored in uint64_t, with the upper 32 bits being 0 and
+        the lower 32 bits storing the FP32 format.The lower 10 bits of
+        the FP32 format are not involved in computation, and the actual
+        data format is TF32.
+        '''
+        deq_scale_fp32 = deq_scale.to(torch.float32)
+        scale = torch.zeros(deq_scale.shape[0] * 2, dtype=torch.float32, device="npu")
+        scale[0::2] = deq_scale_fp32[0::1]
+        return scale
+
+    def scale_from_float_to_int64(self, scale: torch.Tensor):
+        """Convert float32 scale to int64 representation."""
+        import numpy as np
+        scale = torch.from_numpy(
+            np.frombuffer(scale.cpu().to(torch.float32).numpy().tobytes(),
+                        dtype=np.int32).astype(np.int64)).to(scale.device)
+        return scale
 
 class QwenMoeXliteModel(LlamaXliteModel):
     def initialize(self, runnable: nn.Module, vllm_config: VllmConfig) -> tuple[Model, int, int, torch.dtype]:
@@ -194,16 +300,49 @@ class QwenMoeXliteModel(LlamaXliteModel):
         return config
 
     def _build_model(self, runnable: nn.Module, vllm_config: VllmConfig, config: ModelConfig) -> Model:
+        tp_rank = get_tensor_model_parallel_rank()
         xlite_model = super()._build_model(runnable, vllm_config, config)
         layers = runnable.model.layers
         xlite_model.gate = [layer.mlp.gate.weight for layer in layers]
-        xlite_model.re_up_gate = [
-            layer.mlp.experts.w13_weight[i] for layer in layers for i in range(layer.mlp.experts.local_num_experts)
-        ]
-        xlite_model.re_down = [
-            layer.mlp.experts.w2_weight[i] for layer in layers for i in range(layer.mlp.experts.local_num_experts)
-        ]
-
+        if self.quantization == QuantAscend:
+            config.experts_weight_transpose = False
+            xlite_model.re_up_gate = [
+                layer.mlp.experts.w13_weight_bak[i]
+                for layer in layers
+                for i in range(layer.mlp.experts.local_num_experts)
+            ]
+            xlite_model.re_down = [
+                layer.mlp.experts.w2_weight_bak[i]
+                for layer in layers
+                for i in range(layer.mlp.experts.local_num_experts)
+            ]
+            xlite_model.re_up_gate_scale = [
+                self._prepare_deq_scale_weights(layer.mlp.experts.w13_weight_scale_fp32[i])
+                for layer in layers
+                for i in range(layer.mlp.experts.local_num_experts)
+            ]
+            xlite_model.re_down_scale = [
+                self._prepare_deq_scale_weights(layer.mlp.experts.w2_weight_scale[i])
+                for layer in layers
+                for i in range(layer.mlp.experts.local_num_experts)
+            ]
+            if tp_rank == 0:
+                torch.set_printoptions(threshold=500)
+                print(f"re_up_gate: {xlite_model.re_up_gate[0]}, shape: {xlite_model.re_up_gate[0].shape}")
+                print(f"re_down: {xlite_model.re_down[0]}, shape: {xlite_model.re_down[0].shape}")
+                print(f"re_up_gate_scale: {xlite_model.re_up_gate_scale[0]}, shape: {xlite_model.re_up_gate_scale[0].shape}")
+                print(f"re_down_scale: {xlite_model.re_down_scale[0]}, shape: {xlite_model.re_down_scale[0].shape}")
+        else:
+            xlite_model.re_up_gate = [
+                layer.mlp.experts.w13_weight[i]
+                for layer in layers
+                for i in range(layer.mlp.experts.local_num_experts)
+            ]
+            xlite_model.re_down = [
+                layer.mlp.experts.w2_weight[i]
+                for layer in layers
+                for i in range(layer.mlp.experts.local_num_experts)
+            ]
         return xlite_model
 
 
